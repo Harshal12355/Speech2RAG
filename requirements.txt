@@ -1,0 +1,5 @@
+vosk>=0.3.42
+numpy>=1.20.0
+sounddevice>=0.4.4
+sentence-transformers>=2.2.2
+scikit-learn>=1.0.2 
