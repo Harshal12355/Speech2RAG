@@ -1,0 +1,159 @@
+import streamlit as st
+import sounddevice as sd
+import numpy as np
+import threading
+import time
+import queue
+import os
+from speech_rag import Speech2RAG
+
+# Initialize session state
+if "transcription_active" not in st.session_state:
+    st.session_state.transcription_active = False
+    st.session_state.rag_system = None
+    st.session_state.transcript = ""
+    st.session_state.transcript_history = []
+    st.session_state.audio_queue = queue.Queue()
+    st.session_state.audio_device = None
+    st.session_state.questions = []
+    st.session_state.answers = []
+
+# Custom Speech2RAG for Streamlit that doesn't block with input()
+class StreamlitSpeech2RAG(Speech2RAG):
+    def start_with_device(self, device_id):
+        """Non-blocking start with specified device ID"""
+        try:
+            device_info = sd.query_devices()[device_id]
+            if device_info['max_input_channels'] == 0:
+                return False, "Selected device has no input channels!"
+                
+            self.is_running = True
+            
+            # Start the processing thread
+            self.processing_thread = threading.Thread(target=self.process_audio, daemon=True)
+            self.processing_thread.start()
+            
+            # Start the audio stream with the selected device
+            self.audio_thread = sd.RawInputStream(
+                samplerate=16000,  # SAMPLE_RATE
+                blocksize=2000,    # CHUNK_SIZE
+                device=device_id,
+                dtype=np.int16,
+                channels=1,        # CHANNELS
+                callback=self.audio_callback
+            )
+            self.audio_thread.start()
+            return True, "Started successfully"
+            
+        except Exception as e:
+            return False, str(e)
+
+# Streamlit UI
+st.title("🎙️ Speech2RAG: Real-Time Transcription + RAG")
+st.markdown("""
+- Transcribe audio in real-time with VOSK
+- Ask questions about the transcription using Ollama
+- Powered by your local Gemma model
+""")
+
+# Sidebar for settings
+with st.sidebar:
+    st.header("Settings")
+    
+    # List available audio devices
+    devices = sd.query_devices()
+    device_options = []
+    for i, device in enumerate(devices):
+        if device['max_input_channels'] > 0:  # Only show input devices
+            device_options.append(f"{i}: {device['name']}")
+    
+    selected_device = st.selectbox(
+        "Audio Input Device",
+        options=device_options,
+        index=0 if device_options else None,
+    )
+    
+    # Get device ID from selection
+    device_id = int(selected_device.split(":")[0]) if selected_device else None
+    
+    model_path = st.selectbox(
+        "VOSK Model",
+        options=["models/vosk-model-small-en-us-0.15", "models/vosk-model-en-us-0.22", "model/vosk-model-en-us-0.42-gigaspeech"],
+        index=0,
+    )
+    
+    rag_model = st.selectbox(
+        "Ollama Model",
+        options=["gemma3:1b", "gemma3:4b", "deepseek-r1:1.5b" , "deepseek-r1:7b"],
+        index=0,
+    )
+
+# Start/Stop Transcription
+col1, col2 = st.columns(2)
+with col1:
+    if st.button("🎤 Start Transcription", disabled=st.session_state.transcription_active):
+        with st.spinner("Loading speech recognition model..."):
+            st.session_state.rag_system = StreamlitSpeech2RAG(model_path=model_path, rag_model=rag_model)
+            success, message = st.session_state.rag_system.start_with_device(device_id)
+            
+            if success:
+                st.session_state.transcription_active = True
+                st.success("Transcription started! Speak now...")
+            else:
+                st.error(f"Failed to start: {message}")
+
+with col2:
+    if st.button("⏹️ Stop Transcription", disabled=not st.session_state.transcription_active):
+        if st.session_state.rag_system:
+            st.session_state.rag_system.stop()
+            st.session_state.transcription_active = False
+            st.warning("Transcription stopped.")
+
+# Display live transcript in a container
+st.subheader("Live Transcript")
+transcript_container = st.container()
+transcript_area = transcript_container.empty()
+
+# Update transcript in a container
+if st.session_state.transcription_active and st.session_state.rag_system:
+    # This will create placeholder for transcript
+    transcript_text = st.session_state.rag_system.get_full_transcript() or "Waiting for speech..."
+    transcript_area.text_area("", value=transcript_text, height=200, key="transcript_display", disabled=True)
+
+# Question and answer section
+st.subheader("Ask Questions")
+question = st.text_input("Ask a question about the transcription:", key="question_input")
+
+if st.button("Submit Question", disabled=not st.session_state.transcription_active) and question:
+    if not st.session_state.rag_system:
+        st.error("Transcription system is not active.")
+    else:
+        with st.spinner("Generating answer..."):
+            answer = st.session_state.rag_system.answer_question_with_llm(question)
+            st.session_state.questions.append(question)
+            st.session_state.answers.append(answer)
+
+# Display Q&A history
+if st.session_state.questions:
+    st.subheader("Question & Answer History")
+    for i, (q, a) in enumerate(zip(st.session_state.questions, st.session_state.answers)):
+        with st.expander(f"Q: {q}", expanded=(i == len(st.session_state.questions) - 1)):
+            st.markdown(a)
+
+# Auto-refresh the transcript (updates every 2 seconds)
+if st.session_state.transcription_active:
+    st.empty()  # This is required for the refresh to work
+    time.sleep(2)  # Wait for 2 seconds
+    st.rerun()  # Updated from st.experimental_rerun()
+
+# Instructions
+with st.expander("How to Use"):
+    st.markdown("""
+    1. Select your **audio input device** in the sidebar
+    2. Choose the **VOSK model** and **Ollama model**
+    3. Click **Start Transcription** and speak
+    4. Ask questions in the input box
+    5. Click **Stop Transcription** when done
+    
+    **Note**: For system audio, select "Stereo Mix" or similar device if available.
+    """)
